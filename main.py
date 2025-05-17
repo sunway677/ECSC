@@ -1,12 +1,13 @@
 import os
 
+# Set environment variable to allow duplicate OpenMP libraries, useful in some environments
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import argparse
 from models.autoencoder import ResAutoencoder
-from models.feature_extractor import CLIPFeatureExtractor
+from models.feature_extractor import CLIPFeatureExtractor # Assuming this is the correct path
 from data.dataloader import get_dataloaders
-from train import train_autoencoder_with_energy
+from train import train_autoencoder_with_energy # Assuming this is the correct path
 from utils.visualization import test_and_visualize, evaluate_full_dataset
 from utils.checkpoint import load_checkpoint
 
@@ -44,13 +45,13 @@ def main():
 
     # Energy loss settings
     parser.add_argument('--use_energy_loss', action='store_true', default=True,
-                        help='use energy loss with CLIP features (default: False)')
+                        help='use energy loss with CLIP features (default: True)')
 
-    # 能量加权MSE参数
+    # Energy-weighted MSE parameters
     parser.add_argument('--use_energy_weighted_mse', action='store_true', default=True,
-                        help='use energy-weighted MSE loss (requires --use_energy_loss, default: False)')
+                        help='use energy-weighted MSE loss (requires --use_energy_loss, default: True)')
     parser.add_argument('--energy_weight_alpha', type=float, default=2.0,
-                        help='alpha parameter for energy weight mapping in range [0.8, 1.2] (default: 2.0)')
+                        help='alpha parameter for energy weight mapping (default: 2.0)')
 
     # Loss weights
     parser.add_argument('--lambda_energy', type=float, default=0.003348570462810393,
@@ -71,7 +72,7 @@ def main():
                         help='only run evaluation on test set')
     args = parser.parse_args()
 
-    # 如果用户启用了能量加权MSE但未启用能量损失，则发出警告
+    # If the user enables energy-weighted MSE but not energy loss, issue a warning
     if args.use_energy_weighted_mse and not args.use_energy_loss:
         print("WARNING: Energy-weighted MSE requires energy loss to be enabled.")
         print("Setting --use_energy_weighted_mse=False since --use_energy_loss is not enabled.")
@@ -87,9 +88,9 @@ def main():
         'lambda_skip': args.lambda_skip,
         'tau': args.tau,
         'snr_db': args.snr_db,
-        'bottleneck_dim': 24,
-        'skip_channels': 10,
-        'use_energy_loss': args.use_energy_loss,  # 修正：使用一致的命名
+        'bottleneck_dim': 24, # Bottleneck dimension for the autoencoder
+        'skip_channels': 10,  # Number of channels for skip connections
+        'use_energy_loss': args.use_energy_loss, # Corrected: use consistent naming
         'use_energy_weighted_mse': args.use_energy_weighted_mse,
         'energy_weight_alpha': args.energy_weight_alpha
     }
@@ -112,10 +113,10 @@ def main():
             device,
             model_name=CLIP_MODELS[args.clip_model]
         )
-        feature_extractor.eval()
+        feature_extractor.eval() # Set feature extractor to evaluation mode
         print("Energy loss: ENABLED - Using CLIP features")
 
-        # 打印能量加权MSE状态
+        # Print energy-weighted MSE status
         if args.use_energy_weighted_mse:
             print(f"Energy-weighted MSE: ENABLED - alpha={args.energy_weight_alpha}")
         else:
@@ -130,7 +131,7 @@ def main():
 
     # Print compression information
     compressed_info = model.get_compressed_size()
-    orig_size = 3 * 32 * 32
+    orig_size = 3 * 32 * 32 # Assuming 3 channels, 32x32 image size
     print(f"Original image size: {orig_size:,} elements")
     print(f"Compressed size: {compressed_info['total']:,} elements")
     print(f"Compression ratio: {orig_size / compressed_info['total']:.2f}x")
@@ -147,12 +148,13 @@ def main():
         checkpoint_path = args.checkpoint_path or f"{args.checkpoint_dir}/latest_checkpoint.pth"
         print(f"\nLoading checkpoint from: {checkpoint_path}")
 
-        dummy_optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        # Create a dummy optimizer for loading checkpoint if optimizer state is saved
+        dummy_optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate']) # Use configured LR
         epoch, _ = load_checkpoint(model, dummy_optimizer, checkpoint_path)
         print(f"Successfully loaded checkpoint from epoch {epoch}")
 
         if args.eval_only:
-            # 在所有测试SNR值上进行完整评估
+            # Perform full evaluation on all test SNR values
             if args.test_snr_values is not None:
                 for snr in args.test_snr_values:
                     model.set_channel_snr(snr)
@@ -162,23 +164,23 @@ def main():
                     print(f"Average PSNR: {metrics['PSNR']:.2f} dB")
                     print(f"Average SSIM: {metrics['SSIM']:.4f}")
             else:
-                # 使用默认SNR进行评估
+                # Evaluate with default SNR
                 print(f"\nTesting with default SNR = {model.get_current_snr()} dB")
                 metrics = evaluate_full_dataset(model, test_loader, device)
                 print(f"Results:")
                 print(f"Average PSNR: {metrics['PSNR']:.2f} dB")
                 print(f"Average SSIM: {metrics['SSIM']:.4f}")
         else:
-            # Test model with specified SNR values
+            # Test model with specified SNR values and visualize
             if args.test_snr_values is not None:
                 for snr in args.test_snr_values:
                     model.set_channel_snr(snr)
-                    model.eval()
+                    model.eval() # Ensure model is in eval mode
                     print(f"\nTesting with SNR = {snr} dB")
                     test_and_visualize(model, test_loader, device, num_images=args.num_test_images)
             else:
-                # Test with default SNR
-                model.eval()
+                # Test with default SNR and visualize
+                model.eval() # Ensure model is in eval mode
                 print(f"\nTesting with default SNR = {model.get_current_snr()} dB")
                 test_and_visualize(model, test_loader, device, num_images=args.num_test_images)
 
@@ -200,12 +202,12 @@ def main():
             learning_rate=config['learning_rate'],
             lambda_energy=config['lambda_energy'],
             lambda_compress=config['lambda_compress'],
-            lambda_skip=config['lambda_skip'],
+            lambda_skip=config['lambda_skip'], # Pass lambda_skip
             checkpoint_dir=args.checkpoint_dir,
             resume=args.resume,
-            use_energy_loss=config['use_energy_loss'],  # 修正：使用一致的命名
+            use_energy_loss=config['use_energy_loss'], # Corrected: use consistent naming
             use_energy_weighted_mse=config['use_energy_weighted_mse'],
-            alpha=config['energy_weight_alpha']
+            alpha=config['energy_weight_alpha'] # Pass alpha for energy weighted MSE
         )
 
         # Evaluate trained model
@@ -213,11 +215,13 @@ def main():
         if args.test_snr_values is not None:
             for snr in args.test_snr_values:
                 model.set_channel_snr(snr)
-                model.eval()
+                model.eval() # Ensure model is in eval mode
                 print(f"\nFinal testing with SNR = {snr} dB")
                 test_and_visualize(model, test_loader, device, num_images=args.num_test_images)
         else:
-            model.eval()
+            # Evaluate with the SNR used during the last epoch of training or default if not changed
+            model.eval() # Ensure model is in eval mode
+            print(f"\nFinal testing with SNR = {model.get_current_snr()} dB")
             test_and_visualize(model, test_loader, device, num_images=args.num_test_images)
 
 
