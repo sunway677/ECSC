@@ -6,39 +6,44 @@ from tqdm import tqdm
 import math
 import os
 import shutil
-from losses.energy import ContrastiveLossWithFreeEnergy
+from losses.energy import ContrastiveLossWithFreeEnergy # Assuming this is the correct path for losses
 from utils.checkpoint import save_checkpoint, load_checkpoint
 
 
 def skip_mse_loss(original_skips, processed_skips, weights=None):
     """
-    计算skip层特征的MSE损失
+    Calculate MSE loss for skip layer features.
 
     Args:
-        original_skips: 原始skip特征字典
-        processed_skips: 处理后的skip特征字典
-        weights: 各层的权重字典，默认为None（等权重）
+        original_skips: Dictionary of original skip features.
+        processed_skips: Dictionary of processed skip features.
+        weights: Dictionary of weights for each layer, defaults to None (equal weights).
 
     Returns:
-        加权平均的skip MSE损失
+        Weighted average skip MSE loss.
     """
     if weights is None:
-        # 默认权重，越靠近输出层权重越大
+        # Default weights, layers closer to the output have higher weights
         weights = {
-            'skip0': 0.4,  # 最靠近输出层，最重要
+            'skip0': 0.4,  # Closest to the output layer, most important
             'skip1': 0.3,
             'skip2': 0.2,
-            'skip3': 0.1  # 最靠近输入层，最不重要
+            'skip3': 0.1   # Closest to the input layer, least important
         }
 
     total_loss = 0.0
+    num_valid_skips = 0
     for key in original_skips:
-        if key in processed_skips:
-            # 计算每个skip层的MSE
+        if key in processed_skips and key in weights: # Ensure key exists in all dicts
+            # Calculate MSE for each skip layer
             layer_mse = F.mse_loss(original_skips[key], processed_skips[key])
-            # 加权平均
+            # Weighted average
             total_loss += weights[key] * layer_mse
+            num_valid_skips += weights[key] # Sum of weights for normalization if needed, or just sum weighted losses
 
+    # If you intend to average by the number of skip connections or sum of weights:
+    # if num_valid_skips > 0:
+    #     return total_loss / num_valid_skips # Or simply return total_loss if weights sum to 1 or are relative importance factors
     return total_loss
 
 
@@ -55,24 +60,30 @@ def calculate_psnr(img1, img2):
     # MSE loss
     mse = F.mse_loss(img1, img2, reduction='none').mean(dim=[1, 2, 3])
 
+    # Prevent log10 of zero or negative if MSE is zero
+    # Add a small epsilon to mse if it can be zero.
+    # If images are identical, PSNR is infinite, conventionally set to a high value or handled.
+    # For this function, if mse is 0, sqrt(mse) is 0, 1.0/0 is inf, log10(inf) is inf.
+    # torch.log10(1.0 / (torch.sqrt(mse) + 1e-8)) # Add epsilon for stability if mse can be 0
+
     # Calculate PSNR for each image in the batch
-    psnr = 20 * torch.log10(1.0 / torch.sqrt(mse))
+    psnr_val = 20 * torch.log10(1.0 / torch.sqrt(mse + 1e-10)) # Add small epsilon to avoid division by zero or log of zero
 
     # Return average PSNR
-    return psnr.mean().item()
+    return psnr_val.mean().item()
 
 
 def train_step_combined(model, feature_extractor, criterion, images, device,
                         optimizer_model, optimizer_energy, use_energy_loss=True,
                         lambda_skip=0.5, use_energy_weighted_mse=False, alpha=2.0):
     """
-    合并训练步骤，当能量损失开启时同时训练EnergyNet和主网络，
-    当能量损失关闭时只训练主网络。
+    Combined training step: trains EnergyNet and main network simultaneously when energy loss is enabled,
+    otherwise trains only the main network.
 
     Args:
         model: Autoencoder model
         feature_extractor: CLIP feature extractor
-        criterion: Loss criterion
+        criterion: Loss criterion (instance of ContrastiveLossWithFreeEnergy)
         images: Batch of input images
         device: Device to use
         optimizer_model: Optimizer for main model
@@ -86,79 +97,88 @@ def train_step_combined(model, feature_extractor, criterion, images, device,
         dict: Dictionary containing loss values
         float: PSNR value
     """
-    # 获取模型输出
-    outputs, compressed_features = model(images)
+    # Get model outputs
+    outputs, compressed_features_full = model(images) # Renamed to avoid conflict
 
-    # 准备计算Skip损失所需的原始特征
-    original_skips = compressed_features['original_skips']
-    processed_skips = compressed_features['processed_skips']
+    # Prepare original features needed for calculating Skip loss
+    original_skips = compressed_features_full['original_skips']
+    processed_skips = compressed_features_full['processed_skips']
 
-    # 计算Skip MSE损失
+    # Calculate Skip MSE loss
     skip_loss = skip_mse_loss(original_skips, processed_skips)
 
-    # 为compress_criterion准备简化的特征字典
+    # Prepare a simplified feature dictionary for compress_criterion
+    # Ensure all keys are present in compressed_features_full before accessing
     compress_features_dict = {
-        'bottleneck': compressed_features['bottleneck'],
-        'skip0': compressed_features['skip0'],
-        'skip1': compressed_features['skip1'],
-        'skip2': compressed_features['skip2'],
-        'skip3': compressed_features['skip3'],
-        'concatenated': compressed_features['concatenated']
+        key: compressed_features_full[key]
+        for key in ['bottleneck', 'skip0', 'skip1', 'skip2', 'skip3', 'concatenated']
+        if key in compressed_features_full
     }
 
-    # 分支处理：使用能量损失与否
-    if use_energy_loss and feature_extractor is not None:
-        # 能量损失模式：同时训练EnergyNet和主网络
 
-        # 提取CLIP特征
+    # Branch processing: whether to use energy loss or not
+    if use_energy_loss and feature_extractor is not None and criterion.energy_net is not None:
+        # Energy loss mode: train EnergyNet and main network simultaneously
+
+        # Extract CLIP features
         f_orig = feature_extractor(images)
         f_recon = feature_extractor(outputs)
 
-        # 计算能量损失 - 使用criterion中的forward_energy_margin方法
+        # Calculate energy loss - using forward_energy_margin method from criterion
         energy_loss = criterion.forward_energy_margin(f_orig, f_recon)
 
-        # 基础重建损失计算
+        # Basic reconstruction loss calculation
         if use_energy_weighted_mse:
-            # 使用基于能量加权的MSE损失
+            # Use energy-weighted MSE loss
             with torch.no_grad():
-                # 使用criterion中的compute_energy方法确保一致性
-                E = criterion.compute_energy(f_orig, f_recon)
+                # Use compute_energy method from criterion for consistency
+                E = criterion.compute_energy(f_orig, f_recon) # This requires energy_net to be initialized
                 e_diag = torch.diag(E)
 
-            # 计算per-sample MSE
+            # Calculate per-sample MSE
             per_mse = F.mse_loss(outputs, images, reduction='none').view(images.size(0), -1).mean(1)
 
-            # 基于能量生成权重，映射到[0.8, 1.2]范围
-            # 先标准化到[0,1]区间，再映射到[0.8,1.2]
-            w = torch.sigmoid(alpha * (e_diag - e_diag.mean())) * 0.4 + 0.8
+            # Generate weights based on energy, mapped to [0.8, 1.2] range
+            # First normalize to [0,1] range, then map to [0.8,1.2]
+            # The original sigmoid mapping: torch.sigmoid(alpha * (e_diag - e_diag.mean())) * 0.4 + 0.8
+            # Ensure e_diag is not all same values to avoid NaN if e_diag.mean() is subtracted from itself
+            if e_diag.numel() > 1 and not torch.allclose(e_diag, e_diag.mean()):
+                 w = torch.sigmoid(alpha * (e_diag - e_diag.mean()) / (e_diag.std() + 1e-8)) * 0.4 + 0.8 # Normalize by std
+            else: # Handle single element or all same elements case
+                 w = torch.ones_like(e_diag) * 1.0 # Neutral weight
 
-            # 加权重建损失
+
+            # Weighted reconstruction loss
             recon_loss = (w * per_mse).mean()
         else:
-            # 使用常规MSE损失
+            # Use regular MSE loss
             recon_loss = nn.MSELoss()(outputs, images)
 
-        # 计算压缩损失
+        # Calculate compression loss
         compress_loss = criterion.compress_criterion(compress_features_dict)
 
-        # 计算总损失
+        # Calculate total loss
         total_loss = (recon_loss +
                       criterion.lambda_energy * energy_loss +
                       criterion.lambda_compress * compress_loss +
                       lambda_skip * skip_loss)
 
-        # 清空所有优化器的梯度
+        # Clear gradients of all optimizers
         optimizer_model.zero_grad()
-        optimizer_energy.zero_grad()
+        if optimizer_energy: # Check if optimizer_energy is not None
+             optimizer_energy.zero_grad()
 
-        # 反向传播计算梯度
+
+        # Backpropagate to calculate gradients
         total_loss.backward()
 
-        # 更新所有网络的参数
+        # Update parameters of all networks
         optimizer_model.step()
-        optimizer_energy.step()
+        if optimizer_energy: # Check if optimizer_energy is not None
+            optimizer_energy.step()
 
-        # 更新损失字典
+
+        # Update loss dictionary
         losses = {
             'total': total_loss.item(),
             'recon': recon_loss.item(),
@@ -168,39 +188,41 @@ def train_step_combined(model, feature_extractor, criterion, images, device,
         }
 
     else:
-        # 无能量损失模式：只训练主网络
+        # No energy loss mode: train only the main network
 
-        # 重建损失
+        # Reconstruction loss
         recon_loss = nn.MSELoss()(outputs, images)
 
-        # 压缩损失
-        if hasattr(criterion, 'compress_criterion'):
+        # Compression loss
+        if hasattr(criterion, 'compress_criterion') and callable(criterion.compress_criterion):
             compress_loss = criterion.compress_criterion(compress_features_dict)
         else:
-            compress_loss = torch.tensor(0.0, device=device)
+            compress_loss = torch.tensor(0.0, device=device) # Ensure it's a tensor
 
-        # 总损失
-        total_loss = recon_loss + criterion.lambda_compress * compress_loss + lambda_skip * skip_loss
+        # Total loss
+        lambda_compress_val = criterion.lambda_compress if hasattr(criterion, 'lambda_compress') else 0.0
+        total_loss = recon_loss + lambda_compress_val * compress_loss + lambda_skip * skip_loss
 
-        # 只清空主网络优化器的梯度
+
+        # Clear gradients of only the main network optimizer
         optimizer_model.zero_grad()
 
-        # 反向传播计算梯度
+        # Backpropagate to calculate gradients
         total_loss.backward()
 
-        # 只更新主网络参数
+        # Update only main network parameters
         optimizer_model.step()
 
-        # 更新损失字典
+        # Update loss dictionary
         losses = {
             'total': total_loss.item(),
             'recon': recon_loss.item(),
-            'energy': 0.0,  # 无能量损失
-            'compress': compress_loss.item() if torch.is_tensor(compress_loss) else compress_loss,
+            'energy': 0.0,  # No energy loss
+            'compress': compress_loss.item() if torch.is_tensor(compress_loss) else compress_loss, # Handle if not tensor
             'skip': skip_loss.item()
         }
 
-    # 计算PSNR
+    # Calculate PSNR
     psnr_value = calculate_psnr(outputs, images)
 
     return losses, psnr_value
@@ -225,9 +247,9 @@ def train_autoencoder_with_energy(
 ):
     """
     Main training function for the energy-based semantic autoencoder.
-    使用合并的训练步骤:
-    - 当能量损失开启时同时训练所有网络组件
-    - 当能量损失关闭时只训练主网络
+    Uses a combined training step:
+    - When energy loss is enabled, all network components are trained simultaneously.
+    - When energy loss is disabled, only the main network is trained.
 
     Args:
         model: Main autoencoder model
@@ -254,7 +276,7 @@ def train_autoencoder_with_energy(
 
     # Initialize loss criterion
     criterion = ContrastiveLossWithFreeEnergy(
-        tau=1.0,
+        tau=1.0, # Assuming tau is a parameter of ContrastiveLossWithFreeEnergy
         lambda_compress=lambda_compress,
         lambda_energy=lambda_energy
     )
@@ -262,46 +284,67 @@ def train_autoencoder_with_energy(
     # Initialize energy optimizer (only if using energy loss)
     optimizer_energy = None
     if use_energy_loss and feature_extractor is not None:
-        # Initialize EnergyNet with dummy data
-        dummy_images, _ = next(iter(train_loader))
-        dummy_images = dummy_images.to(device)
-        with torch.no_grad():
-            outputs, _ = model(dummy_images)
-            f_orig = feature_extractor(dummy_images)
-            f_recon = feature_extractor(outputs)
-            _ = criterion.compute_energy(f_orig, f_recon)
+        # Initialize EnergyNet within the criterion by calling compute_energy once.
+        # This ensures energy_net is created before its parameters are accessed by the optimizer.
+        try:
+            dummy_images, _ = next(iter(train_loader))
+            dummy_images = dummy_images.to(device)
+            with torch.no_grad():
+                outputs_dummy, _ = model(dummy_images)
+                f_orig_dummy = feature_extractor(dummy_images)
+                f_recon_dummy = feature_extractor(outputs_dummy)
+                # This call will initialize self.energy_net inside ContrastiveLossWithFreeEnergy
+                _ = criterion.compute_energy(f_orig_dummy, f_recon_dummy)
 
-        # Initialize energy optimizer
-        optimizer_energy = optim.Adam(
-            criterion.energy_net.parameters(),
-            lr=learning_rate
-        )
-    else:
-        # 如果不使用能量网络，创建一个虚拟的优化器以保持API一致性
-        optimizer_energy = optim.Adam([nn.Parameter(torch.zeros(1, device=device))], lr=learning_rate)
+            if criterion.energy_net is not None:
+                 optimizer_energy = optim.Adam(
+                    criterion.energy_net.parameters(),
+                    lr=learning_rate
+                )
+            else:
+                print("Warning: criterion.energy_net is None after initialization attempt. EnergyNet won't be trained.")
+                use_energy_loss = False # Disable energy loss if EnergyNet is not available
+        except StopIteration:
+            print("Error: Training data loader is empty. Cannot initialize EnergyNet.")
+            return model # Or handle error appropriately
+
 
     # Resume from checkpoint if specified
     start_epoch = 0
     if resume:
-        latest_checkpoint = f"{checkpoint_dir}/latest_checkpoint.pth"
-        start_epoch, _ = load_checkpoint(model, optimizer_model, latest_checkpoint)
-        start_epoch += 1
+        latest_checkpoint = os.path.join(checkpoint_dir, "latest_checkpoint.pth")
+        if os.path.exists(latest_checkpoint):
+            # Pass optimizer_energy if it's not None
+            opt_energy_to_load = optimizer_energy if use_energy_loss and optimizer_energy is not None else None
+            start_epoch, _ = load_checkpoint(model, optimizer_model, latest_checkpoint, optimizer_energy=opt_energy_to_load)
+            start_epoch += 1
+            print(f"Resuming training from epoch {start_epoch}")
+        else:
+            print(f"No checkpoint found at {latest_checkpoint}. Starting from scratch.")
+
 
     # Print compression statistics
-    compressed_info = model.get_compressed_size()
-    orig_size = 3 * 32 * 32
-    print("\nCompression Statistics:")
-    print(f"Original size: {orig_size} elements")
-    print(f"Compressed size: {compressed_info['total']} elements")
-    print(f"Compression ratio: {orig_size / compressed_info['total']:.2f}x")
-    print(f"Details:")
-    for name, size in compressed_info.items():
-        if name != 'total':
-            print(f"  {name}: {size} elements")
-    print()
+    if hasattr(model, 'get_compressed_size'):
+        compressed_info = model.get_compressed_size()
+        orig_size = 3 * 32 * 32 # Assuming 3 channels, 32x32 image size
+        print("\nCompression Statistics:")
+        print(f"Original size: {orig_size} elements")
+        if 'total' in compressed_info and compressed_info['total'] > 0:
+            print(f"Compressed size: {compressed_info['total']} elements")
+            print(f"Compression ratio: {orig_size / compressed_info['total']:.2f}x")
+            print(f"Details:")
+            for name, size in compressed_info.items():
+                if name != 'total':
+                    print(f"  {name}: {size} elements")
+        else:
+            print("Compressed size information not available or invalid.")
+        print()
+    else:
+        print("Model does not have 'get_compressed_size' method. Skipping compression stats.")
+
 
     # Print energy calculation mode
-    if use_energy_loss and feature_extractor is not None:
+    if use_energy_loss and feature_extractor is not None and criterion.energy_net is not None:
         print("Energy calculation: Using CLIP features for energy loss")
         print("Training mode: Combined (EnergyNet and main network trained together)")
         if use_energy_weighted_mse:
@@ -310,48 +353,52 @@ def train_autoencoder_with_energy(
             print("Energy-weighted MSE: DISABLED")
     else:
         print("Energy calculation: DISABLED - using only reconstruction and compression loss")
-        print("Training mode: Main network only (EnergyNet is not updated)")
-        print("Energy-weighted MSE: DISABLED (requires use_energy_loss=True)")
+        print("Training mode: Main network only (EnergyNet is not updated or not available)")
+        print("Energy-weighted MSE: DISABLED (requires use_energy_loss=True and EnergyNet)")
 
-    # 打印Skip MSE损失信息
+    # Print Skip MSE loss information
     print(f"Skip MSE Loss: ENABLED - weight: {lambda_skip:.2f}")
-    print("Skip weights: skip0=0.4, skip1=0.3, skip2=0.2, skip3=0.1")
+    print("Skip weights: skip0=0.4, skip1=0.3, skip2=0.2, skip3=0.1 (default)")
 
     # Training loop
-    best_psnr = 0.0  # 跟踪最佳PSNR
-    best_epoch = 0  # 记录最佳PSNR对应的epoch
+    best_psnr = 0.0  # Track the best PSNR
+    best_epoch = 0   # Record the epoch corresponding to the best PSNR
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
+        if use_energy_loss and criterion.energy_net is not None: # Set EnergyNet to train mode
+            criterion.energy_net.train()
+
         running_losses = {
             'total': 0, 'recon': 0, 'energy': 0,
             'compress': 0, 'skip': 0
         }
-        running_psnr = 0  # 追踪PSNR
+        running_psnr = 0  # Track PSNR
 
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
 
-        # 使用合并的训练步骤
-        train_pbar = tqdm(train_loader, desc='Training Networks', leave=False)
+        # Use the combined training step
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1} Training', leave=True) # Changed leave to True
         for i, (images, _) in enumerate(train_pbar):
             images = images.to(device)
 
-            # 使用合并的训练步骤
+            # Use the combined training step
             losses, psnr_value = train_step_combined(
                 model, feature_extractor, criterion,
                 images, device, optimizer_model, optimizer_energy,
-                use_energy_loss, lambda_skip, use_energy_weighted_mse, alpha
+                use_energy_loss and criterion.energy_net is not None, # Pass updated use_energy_loss status
+                lambda_skip, use_energy_weighted_mse, alpha
             )
 
             # Update running losses and PSNR
-            for k, v in losses.items():
-                running_losses[k] += v
+            for k, v_loss in losses.items(): # Renamed v to v_loss
+                running_losses[k] += v_loss
             running_psnr += psnr_value
 
             # Update progress bar with losses and PSNR
             postfix_dict = {
-                k: f'{v / (i + 1):.4f}'
-                for k, v in running_losses.items()
+                k_loss: f'{v_loss_val / (i + 1):.4f}' # Renamed k,v
+                for k_loss, v_loss_val in running_losses.items()
             }
             postfix_dict['psnr'] = f'{running_psnr / (i + 1):.2f}'
             train_pbar.set_postfix(postfix_dict)
@@ -360,25 +407,23 @@ def train_autoencoder_with_energy(
         avg_losses = {k: v / len(train_loader) for k, v in running_losses.items()}
         avg_psnr = running_psnr / len(train_loader)
 
-        # 更新最佳PSNR
+        # Update best PSNR
         if avg_psnr > best_psnr:
             best_psnr = avg_psnr
             best_epoch = epoch + 1
 
-            # 保存当前checkpoint
+            # Save current checkpoint as the best one so far
             save_checkpoint(
                 model=model,
                 optimizer=optimizer_model,
                 epoch=epoch,
                 loss=avg_losses['total'],
-                checkpoint_dir=checkpoint_dir
+                checkpoint_dir=checkpoint_dir,
+                filename="best_psnr_checkpoint.pth", # Save directly as best
+                optimizer_energy=optimizer_energy if use_energy_loss and criterion.energy_net is not None else None
             )
+            print(f"Best model saved: best_psnr_checkpoint.pth (PSNR: {best_psnr:.2f} dB at Epoch {best_epoch})")
 
-            # 将最新保存的checkpoint复制为best_psnr_checkpoint.pth
-            latest_checkpoint = os.path.join(checkpoint_dir, "latest_checkpoint.pth")
-            best_checkpoint = os.path.join(checkpoint_dir, "best_psnr_checkpoint.pth")
-            shutil.copyfile(latest_checkpoint, best_checkpoint)
-            print(f"Best model saved as: {best_checkpoint} (PSNR: {best_psnr:.2f} dB)")
 
         # Print epoch summary
         print(f"\nEpoch {epoch + 1} Summary:")
@@ -388,14 +433,18 @@ def train_autoencoder_with_energy(
         print(f"PSNR: {avg_psnr:.2f} dB")
         print(f"Best PSNR: {best_psnr:.2f} dB (Epoch {best_epoch})")
 
-        # Save checkpoint
+        # Save latest checkpoint
         save_checkpoint(
             model=model,
             optimizer=optimizer_model,
             epoch=epoch,
             loss=avg_losses['total'],
-            checkpoint_dir=checkpoint_dir
+            checkpoint_dir=checkpoint_dir,
+            filename="latest_checkpoint.pth", # Explicitly name latest checkpoint
+            optimizer_energy=optimizer_energy if use_energy_loss and criterion.energy_net is not None else None
         )
+        print(f"Latest checkpoint saved: latest_checkpoint.pth")
+
 
     print(f"\nTraining completed. Best PSNR: {best_psnr:.2f} dB achieved at Epoch {best_epoch}")
     return model
