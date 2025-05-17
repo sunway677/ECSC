@@ -118,18 +118,18 @@ class UpBlock(nn.Module):
 
 
 class UnifiedDenoiser(nn.Module):
-    """统一的去噪模块，针对AWGN噪声进行优化"""
+    """Unified denoising module, optimized for AWGN noise."""
 
     def __init__(self, in_channels, depth=5):
         super(UnifiedDenoiser, self).__init__()
 
-        # 初始特征提取
+        # Initial feature extraction
         self.head = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True)
         )
 
-        # 残差去噪块
+        # Residual denoising blocks
         layers = []
         for _ in range(depth):
             layers.append(nn.Sequential(
@@ -141,19 +141,19 @@ class UnifiedDenoiser(nn.Module):
             ))
         self.res_blocks = nn.ModuleList(layers)
 
-        # 输出层 - 预测残差噪声
+        # Output layer - predicts residual noise
         self.tail = nn.Conv2d(64, in_channels, kernel_size=3, padding=1)
 
     def forward(self, x):
-        # 特征提取
+        # Feature extraction
         f = self.head(x)
 
-        # 残差去噪处理
+        # Residual denoising process
         res = f
         for block in self.res_blocks:
-            res = res + block(res)
+            res = res + block(res) # Residual connection within the denoiser
 
-        # 预测噪声并从输入中减去
+        # Predict noise and subtract it from the input
         noise = self.tail(res)
         denoised = x - noise
 
@@ -162,103 +162,103 @@ class UnifiedDenoiser(nn.Module):
 
 class FeatureProcessor(nn.Module):
     """
-    特征处理模块：分别处理每个特征
-    - 单独对每个特征应用噪声
-    - 单独对每个特征进行去噪
-    - 不再合并压缩特征
+    Feature processing module: processes each feature separately
+    - Applies noise to each feature individually
+    - Denoises each feature individually
+    - No longer merges compressed features for transmission
     """
 
     def __init__(self, snr_db=20, bottleneck_channels=20, skip_channels=9):
         super(FeatureProcessor, self).__init__()
 
-        # 信道噪声模块
+        # Channel noise module
         self.channel_noise = ChannelNoise(snr_db)
 
-        # 特征拼接前的1x1卷积调整通道
+        # 1x1 convolutions to adjust channels before feature concatenation/processing
         self.s0_adjust = nn.Conv2d(64, skip_channels, kernel_size=1)
         self.s1_adjust = nn.Conv2d(128, skip_channels, kernel_size=1)
         self.s2_adjust = nn.Conv2d(256, skip_channels, kernel_size=1)
         self.s3_adjust = nn.Conv2d(512, skip_channels, kernel_size=1)
         self.b_adjust = nn.Conv2d(512, bottleneck_channels, kernel_size=1)
 
-        # 单独的去噪器 - 为每个特征创建专门的去噪器
+        # Individual denoisers - create a dedicated denoiser for each feature
         self.denoiser_s0 = UnifiedDenoiser(in_channels=skip_channels)
         self.denoiser_s1 = UnifiedDenoiser(in_channels=skip_channels)
         self.denoiser_s2 = UnifiedDenoiser(in_channels=skip_channels)
         self.denoiser_s3 = UnifiedDenoiser(in_channels=skip_channels)
         self.denoiser_b = UnifiedDenoiser(in_channels=bottleneck_channels)
 
-        # 特征分割后的1x1卷积恢复通道
+        # 1x1 convolutions to restore channels after feature splitting/processing
         self.s0_restore = nn.Conv2d(skip_channels, 64, kernel_size=1)
         self.s1_restore = nn.Conv2d(skip_channels, 128, kernel_size=1)
         self.s2_restore = nn.Conv2d(skip_channels, 256, kernel_size=1)
         self.s3_restore = nn.Conv2d(skip_channels, 512, kernel_size=1)
         self.b_restore = nn.Conv2d(bottleneck_channels, 512, kernel_size=1)
 
-        # 保存通道数参数
+        # Save channel number parameters
         self.bottleneck_channels = bottleneck_channels
         self.skip_channels = skip_channels
 
     def set_snr(self, snr_db):
-        """设置信道SNR"""
+        """Set the channel SNR"""
         self.channel_noise.set_snr(snr_db)
 
     def get_snr(self):
-        """获取当前SNR"""
+        """Get the current SNR"""
         return self.channel_noise.snr_db
 
     def forward(self, skip0, skip1, skip2, skip3, bottleneck):
         """
-        处理所有特征 - 直接对每个特征单独加噪
+        Process all features - directly apply noise to each feature individually
 
         Args:
-            skip0 (Tensor): 第一层特征 [B, 64, 32, 32]
-            skip1 (Tensor): 第二层特征 [B, 128, 16, 16]
-            skip2 (Tensor): 第三层特征 [B, 256, 8, 8]
-            skip3 (Tensor): 第四层特征 [B, 512, 4, 4]
-            bottleneck (Tensor): 瓶颈特征 [B, 512, 4, 4]
+            skip0 (Tensor): First layer features [B, 64, 32, 32]
+            skip1 (Tensor): Second layer features [B, 128, 16, 16]
+            skip2 (Tensor): Third layer features [B, 256, 8, 8]
+            skip3 (Tensor): Fourth layer features [B, 512, 4, 4]
+            bottleneck (Tensor): Bottleneck features [B, 512, 4, 4]
 
         Returns:
-            tuple: 去噪后的各层特征
+            tuple: Denoised features from each layer
         """
-        # 调整通道数，降低传输开销
+        # Adjust channel numbers to reduce transmission overhead
         s0 = self.s0_adjust(skip0)  # [B, skip_channels, 32, 32]
         s1 = self.s1_adjust(skip1)  # [B, skip_channels, 16, 16]
         s2 = self.s2_adjust(skip2)  # [B, skip_channels, 8, 8]
         s3 = self.s3_adjust(skip3)  # [B, skip_channels, 4, 4]
         b = self.b_adjust(bottleneck)  # [B, bottleneck_channels, 4, 4]
 
-        # 直接对每个特征单独加噪（DeepJSCC风格）
+        # Directly apply noise to each feature individually (DeepJSCC style)
         noisy_s0 = self.channel_noise(s0)
         noisy_s1 = self.channel_noise(s1)
         noisy_s2 = self.channel_noise(s2)
         noisy_s3 = self.channel_noise(s3)
         noisy_b = self.channel_noise(b)
 
-        # 对每个加噪特征进行单独去噪
+        # Denoise each noisy feature individually
         denoised_s0 = self.denoiser_s0(noisy_s0)
         denoised_s1 = self.denoiser_s1(noisy_s1)
         denoised_s2 = self.denoiser_s2(noisy_s2)
         denoised_s3 = self.denoiser_s3(noisy_s3)
         denoised_b = self.denoiser_b(noisy_b)
 
-        # 恢复通道数
+        # Restore channel numbers
         r_s0 = self.s0_restore(denoised_s0)
         r_s1 = self.s1_restore(denoised_s1)
         r_s2 = self.s2_restore(denoised_s2)
         r_s3 = self.s3_restore(denoised_s3)
         r_b = self.b_restore(denoised_b)
 
-        # 为了保持API兼容性，我们仍然需要返回一个concatenated张量
-        # 但实际上这个张量不再用于传输
-        # 我们可以将调整尺寸后的特征拼接起来仅用损失计算
+        # For API compatibility, we still need to return a concatenated tensor.
+        # However, this tensor is no longer used for transmission.
+        # We can concatenate the resized features solely for loss calculation.
         s0_down = F.adaptive_avg_pool2d(s0, (4, 4))
         s1_down = F.adaptive_avg_pool2d(s1, (4, 4))
         s2_down = F.adaptive_avg_pool2d(s2, (4, 4))
         concatenated = torch.cat([s0_down, s1_down, s2_down, s3, b], dim=1)
 
-        # 为保持API兼容性，我们还需要一个"noisy"和"denoised"的合并版本
-        # 这些主要用于分析
+        # For API compatibility, we also need a "noisy" and "denoised" combined version.
+        # These are mainly for analysis.
         noisy_s0_down = F.adaptive_avg_pool2d(noisy_s0, (4, 4))
         noisy_s1_down = F.adaptive_avg_pool2d(noisy_s1, (4, 4))
         noisy_s2_down = F.adaptive_avg_pool2d(noisy_s2, (4, 4))
