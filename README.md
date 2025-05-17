@@ -34,7 +34,7 @@ Experiments on CIFAR-10 over AWGN channels demonstrate ECSC’s superiority, esp
 ## System Architecture
 
 
-[ECSC.pdf](https://github.com/sunway677/ECSC/ECSC.pdf)
+![ECSC Architecture](./ECSC.pdf)
 
 ## Requirements
 
